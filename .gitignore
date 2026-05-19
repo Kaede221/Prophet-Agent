@@ -67,3 +67,6 @@ documents
 temp
 venv
 /apks/
+
+
+.vscode/

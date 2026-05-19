@@ -1,6 +1,7 @@
 import json
 import re
 import time
+import os
 import openai
 import configparser
 import base64
@@ -13,84 +14,79 @@ def encode_image(image_path):
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 
-def ask_gpt4o(system_prompt, user_prompt, images: List[str], need_json=True) -> dict:
+def _load_config():
     config = configparser.ConfigParser()
-    config.read('../config/config.ini')
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "config.ini"),
+        "../config/config.ini",
+        "config/config.ini",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            config.read(path, encoding="utf-8")
+            return config
+    raise FileNotFoundError("config.ini not found in any of: " + ", ".join(candidates))
 
-    # 获取GPT API密钥和endpoint
+
+def ask_gpt4o(system_prompt, user_prompt, images: List[str], need_json=True) -> dict:
+    """Backed by DeepSeek (OpenAI-compatible chat API).
+
+    DeepSeek has no vision endpoint, so any image paths passed in are
+    ignored with a warning. The function name is preserved so callers
+    in agent_semantic / agent_execute keep working without edits.
+    """
+    config = _load_config()
+
     ak = config.get('gpt4', 'gpt_key')
     endpoint = config.get('gpt4', 'endpoint')
-    content = [
-        {
-            "type": "text",
-            "text": user_prompt
-        }
-    ]
-    for img in images:
-        base64_img = encode_image(img)
-        content.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/jpeg;base64,{base64_img}"
-            }
-        })
-    api_version = "2024-03-01-preview"
-    ak = ak
-    model_name = "gpt-4o-2024-05-13"
+    model_name = config.get('gpt4', 'model', fallback='deepseek-chat')
     max_tokens = 4096
-    client = openai.AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_version=api_version,
-        api_key=ak,
-    )
+
+    if images:
+        print(Fore.YELLOW + f"[ask_gpt4o] DeepSeek has no vision API; ignoring {len(images)} image(s)." + Fore.RESET)
+
+    client = openai.OpenAI(api_key=ak, base_url=endpoint)
 
     max_attempts = 5
     attempt = 0
-    have_answer = False
     while attempt < max_attempts:
         try:
-            completion = client.chat.completions.create(
+            kwargs = dict(
                 model=model_name,
                 temperature=0.0,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": content
-                    }
+                    {"role": "system", "content": system_prompt or ""},
+                    {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
             )
-            have_answer = True
+            if need_json:
+                kwargs["response_format"] = {"type": "json_object"}
+            completion = client.chat.completions.create(**kwargs)
         except Exception as e:
-            print(Fore.RED + "gpt4o Exception: " + str(e) + Fore.RESET)
-            if 'qpm limit' in str(e):
+            print(Fore.RED + "deepseek Exception: " + str(e) + Fore.RESET)
+            if 'rate' in str(e).lower() or 'qpm' in str(e).lower():
                 time.sleep(20)
             else:
                 time.sleep(5)
             attempt += 1
             if attempt == max_attempts:
-                return str(e) + "gpt ans failed, parse failed"
-        if have_answer:
-            response = json.loads(completion.model_dump_json())
-            # print(Fore.YELLOW + response['choices'][0]['message']['content'] + Fore.RESET)
-            if not need_json:
-                return response['choices'][0]['message']['content']
-            else:
-                pattern = r'\{[^}]*\}'
+                return str(e) + " - deepseek call failed"
+            continue
+
+        response = json.loads(completion.model_dump_json())
+        text = response['choices'][0]['message']['content']
+        if not need_json:
+            return text
+        try:
+            return json.loads(text)
+        except Exception:
+            pattern = r'\{[^}]*\}'
+            matches = re.findall(pattern, text)
+            if matches:
                 try:
-                    matches = re.findall(pattern, response['choices'][0]['message']['content'])
-                    # Assuming we want the first match (in this case, there is only one)
-                    if matches:
-                        extracted_info = matches[0]
-                        return json.loads(extracted_info)
-                    else:
-                        attempt += 1
+                    return json.loads(matches[0])
                 except Exception as e:
-                    print(Fore.RED + "re match Exception: " + str(e) + Fore.RESET)
-        else:
+                    print(Fore.RED + "json parse Exception: " + str(e) + Fore.RESET)
             attempt += 1
     return "None"
